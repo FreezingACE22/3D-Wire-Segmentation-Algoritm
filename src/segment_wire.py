@@ -450,6 +450,250 @@ def tangent_at(points: np.ndarray, i: int) -> np.ndarray:
         return np.array([0.0, 0.0, 1.0], dtype=float)
     return v / norm
 
+# ----------------------------
+# Orientation helpers
+# ----------------------------
+def _normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < eps:
+        return np.zeros_like(v, dtype=float)
+    return v / n
+
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    x, y, z = v
+    return np.array(
+        [
+            [0.0, -z,   y],
+            [z,    0.0, -x],
+            [-y,   x,   0.0],
+        ],
+        dtype=float,
+    )
+
+
+def _orthogonal_unit(v: np.ndarray) -> np.ndarray:
+    v = _normalize(v)
+    candidates = [
+        np.array([1.0, 0.0, 0.0], dtype=float),
+        np.array([0.0, 1.0, 0.0], dtype=float),
+        np.array([0.0, 0.0, 1.0], dtype=float),
+    ]
+    a = min(candidates, key=lambda c: abs(float(np.dot(c, v))))
+    out = a - np.dot(a, v) * v
+    return _normalize(out)
+
+
+def _rodrigues(axis: np.ndarray, angle: float) -> np.ndarray:
+    axis = _normalize(axis)
+    K = _skew(axis)
+    I = np.eye(3, dtype=float)
+    return I + math.sin(angle) * K + (1.0 - math.cos(angle)) * (K @ K)
+
+
+def rotation_from_a_to_b(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Minimal rotation that maps unit vector a to unit vector b.
+    """
+    a = _normalize(a)
+    b = _normalize(b)
+
+    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
+    v = np.cross(a, b)
+    s = float(np.linalg.norm(v))
+
+    if s < 1e-12:
+        if c > 0.0:
+            return np.eye(3, dtype=float)
+        axis = _orthogonal_unit(a)
+        return _rodrigues(axis, math.pi)
+
+    vx = _skew(v)
+    I = np.eye(3, dtype=float)
+    return I + vx + (vx @ vx) * ((1.0 - c) / (s * s))
+
+
+def initial_normal_from_up(t0: np.ndarray, world_up: np.ndarray) -> np.ndarray:
+    """
+    Build an initial normal perpendicular to the first tangent.
+    """
+    t0 = _normalize(t0)
+    up = _normalize(world_up)
+
+    n0 = up - np.dot(up, t0) * t0
+    if np.linalg.norm(n0) < 1e-12:
+        n0 = _orthogonal_unit(t0)
+    return _normalize(n0)
+
+
+def build_rotation_minimizing_frame(
+    tangents: np.ndarray,
+    world_up: np.ndarray = np.array([0.0, 0.0, 1.0], dtype=float),
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      t_path: tangent
+      n_path: normal
+      b_path: binormal
+
+    Stable right-handed moving frame along the path.
+    """
+    n_pts = tangents.shape[0]
+    t_path = np.zeros_like(tangents, dtype=float)
+    n_path = np.zeros_like(tangents, dtype=float)
+    b_path = np.zeros_like(tangents, dtype=float)
+
+    if n_pts == 0:
+        return t_path, n_path, b_path
+
+    for i in range(n_pts):
+        t_path[i] = _normalize(tangents[i])
+        if np.linalg.norm(t_path[i]) < 1e-12:
+            t_path[i] = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    n_path[0] = initial_normal_from_up(t_path[0], world_up)
+    b_path[0] = _normalize(np.cross(t_path[0], n_path[0]))
+    n_path[0] = _normalize(np.cross(b_path[0], t_path[0]))
+
+    for i in range(1, n_pts):
+        R = rotation_from_a_to_b(t_path[i - 1], t_path[i])
+        n_i = R @ n_path[i - 1]
+
+        n_i = n_i - np.dot(n_i, t_path[i]) * t_path[i]
+        if np.linalg.norm(n_i) < 1e-12:
+            n_i = initial_normal_from_up(t_path[i], world_up)
+        n_i = _normalize(n_i)
+
+        b_i = _normalize(np.cross(t_path[i], n_i))
+        n_i = _normalize(np.cross(b_i, t_path[i]))
+
+        n_path[i] = n_i
+        b_path[i] = b_i
+
+    return t_path, n_path, b_path
+
+
+def frame_to_rotmat(
+    t: np.ndarray,
+    n: np.ndarray,
+    b: np.ndarray,
+    forward_axis: str = "z",
+) -> np.ndarray:
+    """
+    Build world rotation matrix from path frame.
+
+    forward_axis:
+      "z" -> tool local Z follows tangent
+      "x" -> tool local X follows tangent
+      "y" -> tool local Y follows tangent
+    """
+    forward_axis = forward_axis.lower()
+
+    if forward_axis == "z":
+        x_axis = n
+        y_axis = b
+        z_axis = t
+    elif forward_axis == "x":
+        x_axis = t
+        y_axis = n
+        z_axis = b
+    elif forward_axis == "y":
+        x_axis = b
+        y_axis = t
+        z_axis = n
+    else:
+        raise ValueError("forward_axis must be one of: x, y, z")
+
+    return np.column_stack([
+        _normalize(x_axis),
+        _normalize(y_axis),
+        _normalize(z_axis),
+    ])
+
+
+def rotmat_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+    """
+    Convert 3x3 rotation matrix to quaternion [qx, qy, qz, qw].
+    """
+    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
+    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
+    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
+
+    tr = m00 + m11 + m22
+
+    if tr > 0.0:
+        S = math.sqrt(tr + 1.0) * 2.0
+        qw = 0.25 * S
+        qx = (m21 - m12) / S
+        qy = (m02 - m20) / S
+        qz = (m10 - m01) / S
+    elif (m00 > m11) and (m00 > m22):
+        S = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        qw = (m21 - m12) / S
+        qx = 0.25 * S
+        qy = (m01 + m10) / S
+        qz = (m02 + m20) / S
+    elif m11 > m22:
+        S = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        qw = (m02 - m20) / S
+        qx = (m01 + m10) / S
+        qy = 0.25 * S
+        qz = (m12 + m21) / S
+    else:
+        S = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        qw = (m10 - m01) / S
+        qx = (m02 + m20) / S
+        qy = (m12 + m21) / S
+        qz = 0.25 * S
+
+    q = np.array([qx, qy, qz, qw], dtype=float)
+    q /= max(np.linalg.norm(q), 1e-12)
+    return q
+
+
+def wrap_deg(a: float) -> float:
+    a = (a + 180.0) % 360.0 - 180.0
+    if a == -180.0:
+        return 180.0
+    return a
+
+
+def rotmat_to_kawasaki_oat_deg(R: np.ndarray, eps: float = 1e-10) -> np.ndarray:
+    """
+    Convert rotation matrix to Kawasaki/Astorino OAT angles in degrees.
+
+    Convention:
+        R = Rz(O) @ Ry(A) @ Rz(T)
+
+    Returns:
+        np.array([O_deg, A_deg, T_deg], dtype=float)
+    """
+    r00, r01, r02 = R[0, 0], R[0, 1], R[0, 2]
+    r10, r11, r12 = R[1, 0], R[1, 1], R[1, 2]
+    r20, r21, r22 = R[2, 0], R[2, 1], R[2, 2]
+
+    A = math.atan2(math.sqrt(max(0.0, r02 * r02 + r12 * r12)), r22)
+    sA = math.sin(A)
+
+    if abs(sA) > eps:
+        O = math.atan2(r12, r02)
+        T = math.atan2(r21, -r20)
+    else:
+        if r22 > 0.0:
+            O = 0.0
+            T = math.atan2(r10, r00)
+        else:
+            O = math.atan2(-r10, r11)
+            T = 0.0
+
+    return np.array(
+        [
+            wrap_deg(math.degrees(O)),
+            wrap_deg(math.degrees(A)),
+            wrap_deg(math.degrees(T)),
+        ],
+        dtype=float,
+    )
 
 # ----------------------------
 # Local refinement (tangent-normal slices)
@@ -1238,19 +1482,19 @@ def main():
     if len(pts0) < 4:
         raise RuntimeError("Too few bootstrap points after outlier filtering. Reduce outlier_z or dedupe_eps.")
 
-   # Order by dominant PCA axis first (much more stable for tube-like paths)
-    axes = pca_axes_from_points(pts0)
-    main_axis = axes[0]
-    proj = pts0 @ main_axis
-    order = np.argsort(proj)
+    # Order points by path connectivity, not by one PCA projection
+    order = order_points_component_geodesic(
+        pts0,
+        k=int(args.knn_k),
+        max_edge_mult=float(args.max_edge_mult),
+    )
     pts0 = pts0[order]
 
-    # If orientation is reversed, flip so the path starts closer to the lower-X end
-    # (simple consistency rule; can be adjusted later if needed)
+    # Optional: choose direction consistently
     if pts0.shape[0] >= 2 and pts0[0, 0] > pts0[-1, 0]:
         pts0 = pts0[::-1]
 
-# Remove abnormal long jumps after ordering
+    # Remove any remaining pathological long jumps
     pts0 = remove_big_jumps(pts0, z=6.0)
 
     pts = resample_polyline_by_arclength(pts0, ds=max(1e-6, float(args.resample_ds)))
@@ -1274,13 +1518,81 @@ def main():
         radii[ok] = r_new[ok]
         rmses[ok] = e_new[ok]
 
-    # Tangents + bend detection
-    print("[6/7] Detecting bends...", flush=True)
+            # Re-order once more after refinement, then clean and resample lightly
+    order = order_points_component_geodesic(
+        pts,
+        k=int(args.knn_k),
+        max_edge_mult=float(args.max_edge_mult),
+    )
+    pts = pts[order]
+    radii = radii[order]
+    rmses = rmses[order]
+
+    if pts.shape[0] >= 2 and pts[0, 0] > pts[-1, 0]:
+        pts = pts[::-1]
+        radii = radii[::-1]
+        rmses = rmses[::-1]
+
+    pts = remove_big_jumps(pts, z=6.0)
+
+    # Tangents + orientations + bend detection
+    print("[6/7] Detecting bends + building orientations...", flush=True)
     tangents = np.zeros_like(pts, dtype=float)
     for i in range(len(pts)):
         tangents[i] = tangent_at(pts, i)
 
     t_smooth = smooth_vectors(tangents, window=9)
+
+    tool_forward_axis = "x"   # or "z" if you switch back
+    tool_roll_deg = -90.0     # adjust if needed
+
+    t_path, n_path, b_path = build_rotation_minimizing_frame(
+        t_smooth,
+        world_up=np.array([0.0, 0.0, 1.0], dtype=float),
+    )
+
+    quats = np.zeros((len(pts), 4), dtype=float)
+    oats = np.zeros((len(pts), 3), dtype=float)
+
+    for i in range(len(pts)):
+        R = frame_to_rotmat(
+            t=t_path[i],
+            n=n_path[i],
+            b=b_path[i],
+            forward_axis=tool_forward_axis,
+        )
+
+        # fixed roll around the tool's own forward axis
+        if tool_forward_axis == "x":
+            R = R @ _rodrigues(
+                np.array([1.0, 0.0, 0.0], dtype=float),
+                math.radians(tool_roll_deg)
+            )
+        elif tool_forward_axis == "y":
+            R = R @ _rodrigues(
+                np.array([0.0, 1.0, 0.0], dtype=float),
+                math.radians(tool_roll_deg)
+            )
+        elif tool_forward_axis == "z":
+            R = R @ _rodrigues(
+                np.array([0.0, 0.0, 1.0], dtype=float),
+                math.radians(tool_roll_deg)
+            )
+
+        quats[i] = rotmat_to_quat_xyzw(R)
+        oats[i] = rotmat_to_kawasaki_oat_deg(R)
+
+    # Keep quaternion sign continuous
+    for i in range(1, len(quats)):
+        if float(np.dot(quats[i - 1], quats[i])) < 0.0:
+            quats[i] = -quats[i]
+
+    # Safety check
+    qnorms = np.linalg.norm(quats, axis=1)
+    bad = np.where(qnorms < 0.5)[0]
+    if len(bad) > 0:
+        raise RuntimeError("Quaternion generation failed: some rows are near zero.")
+
     angles = turning_angles_deg(t_smooth)
     bend_mask = make_bend_mask(angles, args.angle_thresh_deg, spread=args.bend_spread)
 
@@ -1305,56 +1617,66 @@ def main():
     )
     keep_idx.sort()
 
+
     if args.out_raw:
         with open(args.out_raw, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["i", "x", "y", "z", "dx", "dy", "dz", "radius", "rmse", "bend"])
+            w.writerow([
+                "i",
+                "x", "y", "z",
+                "qx", "qy", "qz", "qw",
+                "o", "a", "t",
+                "radius", "rmse", "bend"
+            ])
             for i in range(len(pts)):
-                dx, dy, dz = tangents[i]
-                w.writerow(
-                    [
-                        i,
-                        pts[i, 0],
-                        pts[i, 1],
-                        pts[i, 2],
-                        dx,
-                        dy,
-                        dz,
-                        radii[i] if np.isfinite(radii[i]) else "",
-                        rmses[i] if np.isfinite(rmses[i]) else "",
-                        int(bend_mask[i]),
-                    ]
-                )
+                qx, qy, qz, qw = quats[i]
+                o_deg, a_deg, t_deg = oats[i]
 
-    with open(args.out, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["i", "x", "y", "z", "dx", "dy", "dz", "radius", "rmse", "bend"])
-        for i in keep_idx:
-            dx, dy, dz = tangents[i]
-            w.writerow(
-                [
+                w.writerow([
                     i,
                     pts[i, 0],
                     pts[i, 1],
                     pts[i, 2],
-                    dx,
-                    dy,
-                    dz,
+                    qx, qy, qz, qw,
+                    o_deg, a_deg, t_deg,
                     radii[i] if np.isfinite(radii[i]) else "",
                     rmses[i] if np.isfinite(rmses[i]) else "",
                     int(bend_mask[i]),
-                ]
-            )
+                ])
 
-    print(f"✔ Done | bootstrap={len(centers)} refined={len(pts)} exported={len(keep_idx)}", flush=True)
-    print(f"✔ Output CSV: {args.out}", flush=True)
+    with open(args.out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "i",
+                "x", "y", "z",
+                "qx", "qy", "qz", "qw",
+                "o", "a", "t",
+                "radius", "rmse", "bend"
+            ])
+            for i in keep_idx:
+                qx, qy, qz, qw = quats[i]
+                o_deg, a_deg, t_deg = oats[i]
+
+                w.writerow([
+                    i,
+                    pts[i, 0],
+                    pts[i, 1],
+                    pts[i, 2],
+                    qx, qy, qz, qw,
+                    o_deg, a_deg, t_deg,
+                    radii[i] if np.isfinite(radii[i]) else "",
+                    rmses[i] if np.isfinite(rmses[i]) else "",
+                    int(bend_mask[i]),
+                ])
+
+    print(f"Done | bootstrap={len(centers)} refined={len(pts)} exported={len(keep_idx)}", flush=True)
+    print(f"Output CSV: {args.out}", flush=True)
     if args.out_raw:
-        print(f"✔ Raw CSV:    {args.out_raw}", flush=True)
+        print(f"Raw CSV:    {args.out_raw}", flush=True)
 
     if not args.no_plot:
         plot_path = os.path.join("data", "plots", "centerline.html")
         write_interactive_plot(args.out, plot_path)
-
 
 if __name__ == "__main__":
     main()
