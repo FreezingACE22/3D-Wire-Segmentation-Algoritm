@@ -1,0 +1,10 @@
+﻿name: step_segmentation
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pythonocc-core
+  - pandas
+  - scipy
+  - numpy
+prefix: C:\Users\rblau\anaconda3\envs\step_segmentation
