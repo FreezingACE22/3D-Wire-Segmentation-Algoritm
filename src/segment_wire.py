@@ -235,8 +235,15 @@ def bootstrap_centers_multi_axis(
     dedupe_eps: float = 0.2,
 ) -> List[CenterSample]:
     """
-    Run bootstrap slicing along multiple directions (XYZ + PCA recommended).
-    Sweeps correctly for *arbitrary* directions by projecting bbox corners onto axis_dir.
+    Run bootstrap slicing along multiple directions.
+
+    Important change from the older version:
+      - one slicing plane can intersect the cable several times;
+      - therefore this function keeps ALL valid circular section clusters,
+        not only the lowest-RMSE cluster from that plane.
+
+    This is what helps path8/path9, where one global plane can cut multiple
+    nearby cable legs or return sections.
     """
     if use_axes is None:
         use_axes = [
@@ -245,7 +252,7 @@ def bootstrap_centers_multi_axis(
             np.array([0.0, 0.0, 1.0], dtype=float),
         ]
 
-    all_pts = []
+    samples: List[CenterSample] = []
 
     for axis_dir in use_axes:
         t_min, t_max, center, axis_unit = axis_sweep_range(bb_min, bb_max, axis_dir)
@@ -266,32 +273,55 @@ def bootstrap_centers_multi_axis(
                 continue
 
             pts2 = project_to_plane(pts3, ax3)
-            fit = best_circle_from_section_points(
+            fits = circle_fits_from_section_points(
                 pts2,
                 min_points=min_points,
                 max_rmse=max_rmse,
             )
-            if fit is None:
+            if not fits:
                 t += slice_step
                 continue
 
-            center2, r, rmse = fit
-            if rmse > max_rmse:
-                t += slice_step
-                continue
-
-            center3 = unproject_from_plane(center2, ax3)
-            all_pts.append(center3.astype(float))
+            for center2, r, rmse, nfit in fits:
+                center3 = unproject_from_plane(center2, ax3)
+                samples.append(
+                    CenterSample(
+                        s=0.0,
+                        x=float(center3[0]),
+                        y=float(center3[1]),
+                        z=float(center3[2]),
+                        r=float(r),
+                        rmse=float(rmse),
+                        npts=int(nfit),
+                    )
+                )
 
             t += slice_step
 
-    if not all_pts:
+    if not samples:
         return []
 
-    pts = np.asarray(all_pts, dtype=float)
-    pts = dedupe_points_eps(pts, eps=float(dedupe_eps))
+    return dedupe_center_samples_eps(samples, eps=float(dedupe_eps))
 
-    return [CenterSample(s=0.0, x=p[0], y=p[1], z=p[2], r=float("nan"), rmse=float("nan"), npts=0) for p in pts]
+
+def dedupe_center_samples_eps(samples: List[CenterSample], eps: float = 0.2) -> List[CenterSample]:
+    """Dedupe samples by position grid, keeping the sample with the better RMSE."""
+    if not samples:
+        return []
+    eps = max(float(eps), 1e-12)
+    best = {}
+    for s in samples:
+        p = np.array([s.x, s.y, s.z], dtype=float)
+        key = tuple(np.round(p / eps).astype(np.int64))
+        old = best.get(key)
+        if old is None:
+            best[key] = s
+            continue
+        old_rmse = old.rmse if np.isfinite(old.rmse) else float("inf")
+        new_rmse = s.rmse if np.isfinite(s.rmse) else float("inf")
+        if new_rmse < old_rmse:
+            best[key] = s
+    return list(best.values())
 
 # ----------------------------
 # Section sampling
@@ -721,19 +751,32 @@ def refine_centers_local_slices(
             continue
 
         sec_pts2 = project_to_plane(sec_pts3, ax3)
-        fit = best_circle_from_section_points(
+        fits = circle_fits_from_section_points(
             sec_pts2,
             min_points=min_points,
             max_rmse=max_rmse,
         )
-        if fit is None:
+        if not fits:
             continue
 
-        center2, r, rmse = fit
-        if rmse > max_rmse:
+        # Local refinement planes can intersect nearby parallel cable legs.
+        # Choose the fitted section whose 3D centre is closest to the current station,
+        # instead of choosing only the lowest RMSE. This prevents snapping to a
+        # neighbouring cable segment at U-turns / close return sections.
+        best = None
+        best_score = float("inf")
+        for center2, r, rmse, _nfit in fits:
+            center3 = unproject_from_plane(center2, ax3)
+            dist = float(np.linalg.norm(center3 - pts[i]))
+            score = dist + 0.10 * float(rmse)
+            if score < best_score:
+                best_score = score
+                best = (center3, r, rmse)
+
+        if best is None:
             continue
 
-        center3 = unproject_from_plane(center2, ax3)
+        center3, r, rmse = best
         new_pts[i] = center3
         radii[i] = r
         rmses[i] = rmse
@@ -1073,7 +1116,9 @@ def knn_median_distance(pts: np.ndarray, k: int = 8) -> np.ndarray:
 
 
 def filter_outliers_knn(pts: np.ndarray, k: int = 8, z: float = 3.5) -> np.ndarray:
-    if len(pts) < 10:
+    # For clean STEP cable solids, sparse but valid end legs can look like KNN
+    # outliers. Use z <= 0 to disable this stage.
+    if len(pts) < 10 or (not np.isfinite(z)) or z <= 0.0:
         return pts
     md = knn_median_distance(pts, k=k)
     med = float(np.median(md))
@@ -1148,15 +1193,33 @@ def dijkstra_dense(adj, src: int) -> np.ndarray:
     return dist
 
 
-def order_points_component_geodesic(pts: np.ndarray, k: int = 10, max_edge_mult: float = 3.0) -> np.ndarray:
-    if len(pts) <= 1:
-        return np.arange(len(pts), dtype=int)
+def connected_components_from_adj(adj) -> List[np.ndarray]:
+    n = len(adj)
+    seen = np.zeros(n, dtype=bool)
+    comps = []
+    for i in range(n):
+        if seen[i]:
+            continue
+        stack = [i]
+        seen[i] = True
+        comp = [i]
+        while stack:
+            u = stack.pop()
+            for v, _ in adj[u]:
+                if not seen[v]:
+                    seen[v] = True
+                    stack.append(v)
+                    comp.append(v)
+        comps.append(np.array(comp, dtype=int))
+    comps.sort(key=len, reverse=True)
+    return comps
 
-    adj = build_mutual_knn_graph(pts, k=k, max_edge_mult=max_edge_mult)
-    comp = largest_connected_component(adj)
-    if comp.size < 2:
-        axis = int(np.argmax(np.ptp(pts, axis=0)))
-        return np.argsort(pts[:, axis])
+
+def order_one_component_geodesic(pts: np.ndarray, adj, comp: np.ndarray) -> np.ndarray:
+    """Return global indices of one connected component ordered by graph geodesic distance."""
+    comp = np.asarray(comp, dtype=int)
+    if comp.size <= 1:
+        return comp
 
     idx_map = {int(old): new for new, old in enumerate(comp)}
     pts_c = pts[comp]
@@ -1169,6 +1232,10 @@ def order_points_component_geodesic(pts: np.ndarray, k: int = 10, max_edge_mult:
                 adj_c[u].append((v, w))
 
     d0 = dijkstra_dense(adj_c, 0)
+    if not np.any(np.isfinite(d0)):
+        axis = int(np.argmax(np.ptp(pts_c, axis=0)))
+        return comp[np.argsort(pts_c[:, axis])]
+
     a = int(np.nanargmax(np.where(np.isfinite(d0), d0, -1.0)))
     da = dijkstra_dense(adj_c, a)
 
@@ -1176,8 +1243,85 @@ def order_points_component_geodesic(pts: np.ndarray, k: int = 10, max_edge_mult:
         axis = int(np.argmax(np.ptp(pts_c, axis=0)))
         return comp[np.argsort(pts_c[:, axis])]
 
-    order_c = np.argsort(da)
-    return comp[order_c]
+    return comp[np.argsort(da)]
+
+
+def stitch_ordered_components(pts: np.ndarray, ordered_components: List[np.ndarray]) -> np.ndarray:
+    """
+    Stitch ordered connected components, but only when the endpoint gap is plausible.
+
+    The previous version connected *every* component by nearest endpoints. That can
+    create a fake long straight line when a few false section centres are generated
+    far away from the real cable path. Here we start from the largest component and
+    only attach another component if its nearest endpoint is close to the current
+    tail. If the gap is too large, the component is treated as an outlier and is
+    not used for the exported path.
+    """
+    comps = [np.asarray(c, dtype=int) for c in ordered_components if len(c) > 0]
+    if not comps:
+        return np.empty((0,), dtype=int)
+    if len(comps) == 1:
+        return comps[0]
+
+    # Estimate normal point spacing from the full cloud. This becomes the gate for
+    # deciding whether two disconnected components are really adjacent path pieces.
+    try:
+        md = knn_median_distance(pts, k=min(6, max(1, len(pts) - 1)))
+        typical_gap = float(np.nanmedian(md))
+    except Exception:
+        typical_gap = 1.0
+    if not np.isfinite(typical_gap) or typical_gap <= 1e-9:
+        typical_gap = 1.0
+
+    max_stitch_gap = max(8.0 * typical_gap, 3.0)
+
+    # Start with the largest component. It is usually the actual cable centreline.
+    comps.sort(key=len, reverse=True)
+    current = comps.pop(0)
+    result = list(current.tolist())
+
+    while comps:
+        tail = pts[result[-1]]
+        best_i = -1
+        best_reverse = False
+        best_d = float("inf")
+
+        for ci, c in enumerate(comps):
+            d_start = float(np.linalg.norm(tail - pts[c[0]]))
+            d_end = float(np.linalg.norm(tail - pts[c[-1]]))
+            if d_start < best_d:
+                best_i = ci
+                best_reverse = False
+                best_d = d_start
+            if d_end < best_d:
+                best_i = ci
+                best_reverse = True
+                best_d = d_end
+
+        # Do not draw a robot trajectory across a large empty space.
+        if best_i < 0 or best_d > max_stitch_gap:
+            break
+
+        c = comps.pop(best_i)
+        if best_reverse:
+            c = c[::-1]
+        result.extend(c.tolist())
+
+    return np.array(result, dtype=int)
+
+def order_points_component_geodesic(pts: np.ndarray, k: int = 10, max_edge_mult: float = 3.0) -> np.ndarray:
+    if len(pts) <= 1:
+        return np.arange(len(pts), dtype=int)
+
+    adj = build_mutual_knn_graph(pts, k=k, max_edge_mult=max_edge_mult)
+    comps = connected_components_from_adj(adj)
+
+    if not comps:
+        axis = int(np.argmax(np.ptp(pts, axis=0)))
+        return np.argsort(pts[:, axis])
+
+    ordered = [order_one_component_geodesic(pts, adj, c) for c in comps]
+    return stitch_ordered_components(pts, ordered)
 
 
 # ----------------------------
@@ -1272,35 +1416,65 @@ def apply_preset(ns: argparse.Namespace, preset: str) -> argparse.Namespace:
 
         # cleanup/order knobs
         ns.dedupe_eps = 0.2
-        ns.outlier_z = 6.0          # <- less aggressive (keeps end legs)
+        ns.outlier_z = 0.0          # disabled: keeps sparse valid legs in path8/path9
         ns.knn_k = 10
-        ns.max_edge_mult = 3.0
+        ns.max_edge_mult = 4.0
         return ns
 
     print(f'Unknown preset "{preset}", using defaults.')
     return ns
 
-def best_circle_from_section_points(
+def _circular_angle_coverage_rad(pts2: np.ndarray, center2: np.ndarray) -> float:
+    """Return angular coverage of points around fitted centre, in radians."""
+    if pts2.shape[0] < 3:
+        return 0.0
+    v = pts2 - center2[None, :]
+    ang = np.mod(np.arctan2(v[:, 1], v[:, 0]), 2.0 * math.pi)
+    ang.sort()
+    gaps = np.diff(np.r_[ang, ang[0] + 2.0 * math.pi])
+    return float(2.0 * math.pi - np.max(gaps))
+
+
+def _cluster_extent_ratio(pts2: np.ndarray) -> float:
+    """Return PCA extent ratio. Circle-like clusters are near 1; line strips are large."""
+    if pts2.shape[0] < 3:
+        return float("inf")
+    x = pts2 - pts2.mean(axis=0, keepdims=True)
+    cov = (x.T @ x) / max(1, pts2.shape[0] - 1)
+    vals = np.linalg.eigvalsh(cov)
+    vals = np.maximum(vals, 1e-12)
+    return float(math.sqrt(vals[-1] / vals[0]))
+
+
+def circle_fits_from_section_points(
     pts2: np.ndarray,
     min_points: int,
     max_rmse: float,
     cluster_eps: Optional[float] = None,
-) -> Optional[Tuple[np.ndarray, float, float]]:
+) -> List[Tuple[np.ndarray, float, float, int]]:
     """
-    Section may contain multiple loops. Cluster in 2D, fit circle per cluster,
-    return the best (lowest RMSE) valid fit.
+    Section may contain multiple loops. Cluster in 2D, fit a circle per cluster,
+    and return ALL *circle-like* valid fits as (center2, radius, rmse, npts).
+
+    Important: longitudinal cuts of a tube can produce long strips/arcs that Kasa
+    can still approximate with a circle. Those false centres were the reason for
+    the very long artificial straight line. Therefore this function now rejects
+    clusters that are not sufficiently circular by using three tests:
+      1) absolute RMSE <= max_rmse,
+      2) relative RMSE <= 25% of radius,
+      3) angular coverage around the fitted centre >= 210 degrees,
+      4) PCA extent ratio <= 4.0.
     """
     if pts2.shape[0] < min_points:
-        return None
+        return []
 
     # choose a scale if not given
     if cluster_eps is None:
-        # typical neighbor distance in 2D (robust)
         d = np.linalg.norm(pts2[:, None, :] - pts2[None, :, :], axis=2)
         np.fill_diagonal(d, np.inf)
         k = min(8, pts2.shape[0] - 1)
         nn = np.partition(d, kth=k - 1, axis=1)[:, :k]
-        cluster_eps = float(np.median(nn)) * 3.0 + 1e-9  # generous within-loop connectivity
+        cluster_eps = float(np.median(nn)) * 3.0 + 1e-9
 
     n = pts2.shape[0]
     used = np.zeros(n, dtype=bool)
@@ -1315,7 +1489,6 @@ def best_circle_from_section_points(
         comp = [i]
         while queue:
             u = queue.pop()
-            # neighbors within eps
             du = np.linalg.norm(pts2 - pts2[u], axis=1)
             nbrs = np.where((~used) & (du <= cluster_eps))[0]
             for v in nbrs.tolist():
@@ -1324,30 +1497,60 @@ def best_circle_from_section_points(
                 comp.append(v)
         clusters.append(np.array(comp, dtype=int))
 
-    best = None
-    best_rmse = float("inf")
+    fits: List[Tuple[np.ndarray, float, float, int]] = []
 
     for idx in clusters:
         if idx.size < min_points:
             continue
-        fit = fit_circle_kasa(pts2[idx])
-        if fit is None:
-            fit = section_center_fallback(pts2[idx])
+
+        pts_c = pts2[idx]
+        fit = fit_circle_kasa(pts_c)
         if fit is None:
             continue
-        c2, r, rmse = fit
-        if rmse <= max_rmse and rmse < best_rmse:
-            best = (c2, r, rmse)
-            best_rmse = rmse
 
-    return best
+        c2, r, rmse = fit
+        if not np.isfinite(r) or r <= 1e-9 or not np.isfinite(rmse):
+            continue
+
+        rel_rmse = float(rmse) / max(float(r), 1e-9)
+        coverage = _circular_angle_coverage_rad(pts_c, c2)
+        extent_ratio = _cluster_extent_ratio(pts_c)
+
+        if rmse > max_rmse:
+            continue
+        if rel_rmse > 0.25:
+            continue
+        if coverage < math.radians(210.0):
+            continue
+        if extent_ratio > 4.0:
+            continue
+
+        fits.append((c2, float(r), float(rmse), int(idx.size)))
+
+    # Stable order: better relative fits first, larger clusters second.
+    fits.sort(key=lambda x: (x[2] / max(x[1], 1e-9), x[2], -x[3]))
+    return fits
+
+
+def best_circle_from_section_points(
+    pts2: np.ndarray,
+    min_points: int,
+    max_rmse: float,
+    cluster_eps: Optional[float] = None,
+) -> Optional[Tuple[np.ndarray, float, float]]:
+    """Compatibility wrapper: return the best fit only."""
+    fits = circle_fits_from_section_points(pts2, min_points, max_rmse, cluster_eps)
+    if not fits:
+        return None
+    c2, r, rmse, _n = fits[0]
+    return c2, r, rmse
 
 def remove_big_jumps(pts: np.ndarray, z: float = 6.0) -> np.ndarray:
     """
     Remove points that create abnormally large segment lengths.
-    Keeps endpoints.
+    Keeps endpoints. Use z <= 0 to disable.
     """
-    if len(pts) < 5:
+    if len(pts) < 5 or (not np.isfinite(z)) or z <= 0.0:
         return pts
 
     seg = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
@@ -1391,9 +1594,9 @@ def main():
 
     # Bootstrap cleanup / ordering controls
     ap.add_argument("--dedupe_eps", type=float, default=0.2)
-    ap.add_argument("--outlier_z", type=float, default=3.5)
+    ap.add_argument("--outlier_z", type=float, default=0.0)
     ap.add_argument("--knn_k", type=int, default=10)
-    ap.add_argument("--max_edge_mult", type=float, default=3.0)
+    ap.add_argument("--max_edge_mult", type=float, default=4.0)
 
     # Refinement
     ap.add_argument("--refine_iters", type=int, default=3)
